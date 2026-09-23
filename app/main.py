@@ -20,6 +20,8 @@ from .schemas import (
     ReservationCreate,
     ReservationList,
     ReservationView,
+    TransferCreate,
+    TransferView,
     Verdict,
     BudgetView,
 )
@@ -52,7 +54,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Differential-Privacy Budget Ledger",
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
     description=(
         "Register epsilon/delta caps per dataset and submit analysis "
@@ -64,7 +66,10 @@ app = FastAPI(
         "idempotent per reservation_id, and are confirmed into analysis "
         "requests or released.  A read-only release forecast simulates future "
         "TTL expiries up to a caller-supplied UTC deadline without changing "
-        "any reservation or database state."
+        "any reservation or database state.  Epsilon cap can also be moved "
+        "between datasets: budget transfers validate both ends against their "
+        "committed (granted + reserved) usage and atomically update both "
+        "caps, idempotent per transfer_id."
     ),
 )
 
@@ -142,6 +147,31 @@ async def _invalid_forecast_deadline(
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={"error": "invalid_forecast_deadline", "detail": exc.args[0]},
+    )
+
+
+@app.exception_handler(db.TransferConflict)
+async def _transfer_conflict(_: Request, exc: db.TransferConflict) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content={
+            "error": "transfer_id_conflict",
+            "transfer_id": exc.args[0],
+            "detail": (
+                "transfer_id was already used for a different transfer payload"
+            ),
+        },
+    )
+
+
+@app.exception_handler(ledger.TransferRejected)
+async def _transfer_rejected(_: Request, exc: ledger.TransferRejected) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content={
+            "error": exc.args[0],
+            "detail": exc.args[1],
+        },
     )
 
 
@@ -273,4 +303,18 @@ async def confirm_reservation(
 )
 async def release_reservation(dataset_id: DATASET_ID, reservation_id: RESERVATION_ID):
     view, http_status = await ledger.release_reservation(dataset_id, reservation_id)
+    return JSONResponse(status_code=http_status, content=view)
+
+
+# ----------------------------------------------------------------- transfers
+
+
+@app.post(
+    "/budget-transfers",
+    response_model=TransferView,
+    tags=["transfers"],
+    summary="Move epsilon cap between two datasets (atomic, idempotent)",
+)
+async def create_budget_transfer(payload: TransferCreate):
+    view, http_status = await ledger.create_transfer(payload)
     return JSONResponse(status_code=http_status, content=view)

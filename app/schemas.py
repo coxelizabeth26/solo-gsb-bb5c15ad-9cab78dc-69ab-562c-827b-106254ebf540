@@ -5,7 +5,15 @@ import math
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+# Registration ceiling for a dataset's epsilon cap.  Budget transfers may
+# raise a target dataset's cap only up to this same limit.
+MAX_EPSILON_CAP = 1_000.0
+
+# Dataset identifiers supplied inside JSON payloads follow the same rules as
+# the path parameters in main.py.
+DATASET_ID_PATTERN = r"^[A-Za-z0-9._\-]+$"
 
 
 def _finite(name: str):
@@ -23,7 +31,7 @@ class DatasetRegister(BaseModel):
     epsilon_cap: float = Field(
         ...,
         gt=0.0,
-        le=1_000.0,
+        le=MAX_EPSILON_CAP,
         examples=[1.0],
         description="Total epsilon budget allowed for this dataset.",
     )
@@ -273,6 +281,78 @@ class ReleaseForecast(BaseModel):
     # State with every expires_at <= deadline removed; reservations expiring
     # strictly after the deadline (or never) keep counting.
     at_deadline: ForecastSnapshot
+
+
+# ---------------------------------------------------------- budget transfers --
+
+
+class TransferCreate(BaseModel):
+    """Move ``epsilon_amount`` of epsilon cap between two datasets.
+
+    Only the ``epsilon_cap`` values change: ``delta_cap`` and every recorded
+    analysis request / reservation stay exactly as they are.
+    """
+
+    transfer_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        examples=["xfer-20260923-0001"],
+        description="Client-generated idempotency key; globally unique.",
+    )
+    source_dataset_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        pattern=DATASET_ID_PATTERN,
+        examples=["sales-2026"],
+        description="Dataset whose epsilon_cap is decreased.",
+    )
+    target_dataset_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        pattern=DATASET_ID_PATTERN,
+        examples=["sales-2027"],
+        description="Dataset whose epsilon_cap is increased.",
+    )
+    epsilon_amount: float = Field(
+        ...,
+        gt=0.0,
+        examples=[0.25],
+        description="Positive amount of epsilon cap moved from source to "
+        "target.",
+    )
+
+    _amount_finite = _finite("epsilon_amount")
+
+    @model_validator(mode="after")
+    def _distinct_datasets(self) -> "TransferCreate":
+        if self.source_dataset_id == self.target_dataset_id:
+            raise ValueError("source and target datasets must differ")
+        return self
+
+
+class TransferView(BaseModel):
+    """Record of an applied budget transfer.
+
+    The ``*_committed`` fields capture each side's occupied epsilon (granted
+    requests composed with non-expired reservations under the dataset's own
+    delta_cap) at the instant the transfer was validated.
+    """
+
+    transfer_id: str
+    source_dataset_id: str
+    target_dataset_id: str
+    epsilon_amount: float
+    source_epsilon_cap_before: float
+    source_epsilon_cap_after: float
+    target_epsilon_cap_before: float
+    target_epsilon_cap_after: float
+    source_committed: float
+    target_committed: float
+    idempotent_replay: bool = False
+    created_at: datetime
 
 
 def utcnow() -> datetime:

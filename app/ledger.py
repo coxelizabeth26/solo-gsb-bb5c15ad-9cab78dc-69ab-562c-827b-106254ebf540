@@ -10,10 +10,12 @@ import aiosqlite
 from . import db, rdp
 from .config import settings
 from .schemas import (
+    MAX_EPSILON_CAP,
     AnalysisRequest,
     DatasetRegister,
     ReservationConfirm,
     ReservationCreate,
+    TransferCreate,
     utcnow,
 )
 
@@ -27,6 +29,13 @@ _write_locks: dict[asyncio.AbstractEventLoop, asyncio.Lock] = {}
 
 class InvalidForecastDeadline(Exception):
     """Release-forecast deadline is not a future UTC instant (HTTP 422)."""
+
+
+class TransferRejected(Exception):
+    """Transfer validation failed against the current budget state (HTTP 409).
+
+    ``args[0]`` carries an API error code, ``args[1]`` the human detail.
+    """
 
 
 def _write_lock() -> asyncio.Lock:
@@ -715,3 +724,130 @@ async def release_forecast(
         "events": events,
         "at_deadline": _forecast_snapshot_view(at_deadline),
     }
+
+
+# ---------------------------------------------------------- budget transfers --
+
+
+def _transfer_view(row: aiosqlite.Row, *, replay: bool) -> dict[str, Any]:
+    return {
+        "transfer_id": row["transfer_id"],
+        "source_dataset_id": row["source_dataset_id"],
+        "target_dataset_id": row["target_dataset_id"],
+        "epsilon_amount": row["epsilon_amount"],
+        "source_epsilon_cap_before": row["source_cap_before"],
+        "source_epsilon_cap_after": row["source_cap_after"],
+        "target_epsilon_cap_before": row["target_cap_before"],
+        "target_epsilon_cap_after": row["target_cap_after"],
+        "source_committed": row["source_committed"],
+        "target_committed": row["target_committed"],
+        "idempotent_replay": replay,
+        "created_at": row["created_at"],
+    }
+
+
+async def _committed_epsilon(
+    conn: aiosqlite.Connection, dataset: aiosqlite.Row, now_iso: str
+) -> float:
+    """Occupied epsilon: granted requests + non-expired reservations, composed.
+
+    Uses the dataset's own ``delta_cap`` as the RDP conversion target, exactly
+    like the admission checks and budget views do.
+    """
+    entries = await _committed_entries(conn, dataset["dataset_id"], now_iso)
+    _, committed, _ = rdp.evaluate_entries(entries, dataset["delta_cap"])
+    return max(0.0, committed)
+
+
+async def create_transfer(payload: TransferCreate) -> tuple[dict[str, Any], int]:
+    """Atomically move epsilon cap from the source to the target dataset.
+
+    Idempotent on ``transfer_id``: replaying the same payload returns the
+    stored record (HTTP 200) without moving budget again; the same
+    ``transfer_id`` with a different payload is a 409.  Validation, both cap
+    updates and the audit record commit in one ``BEGIN IMMEDIATE``
+    transaction, so a rejected transfer leaves both caps untouched and
+    concurrent transfers / analysis requests can never overdraw a budget.
+    """
+    now_iso = utcnow().isoformat()
+
+    async with _write_lock():
+        async with db.connect() as conn:
+            await db.begin_immediate(conn)
+            try:
+                existing = await db.get_transfer(conn, payload.transfer_id)
+                if existing is not None:
+                    # Idempotent replay: same transfer_id must be identical.
+                    same = (
+                        existing["source_dataset_id"] == payload.source_dataset_id
+                        and existing["target_dataset_id"] == payload.target_dataset_id
+                        and existing["epsilon_amount"] == payload.epsilon_amount
+                    )
+                    if not same:
+                        raise db.TransferConflict(payload.transfer_id)
+                    await conn.commit()
+                    return _transfer_view(existing, replay=True), 200
+
+                source = await db.require_dataset(conn, payload.source_dataset_id)
+                target = await db.require_dataset(conn, payload.target_dataset_id)
+
+                # Occupancy on both ends under the existing RDP rules; the
+                # lazy expiry sweep inside _committed_entries runs in this
+                # same transaction, so expired reservations never block a
+                # legitimate transfer.
+                source_committed = await _committed_epsilon(conn, source, now_iso)
+                target_committed = await _committed_epsilon(conn, target, now_iso)
+
+                source_before = source["epsilon_cap"]
+                target_before = target["epsilon_cap"]
+                source_after = source_before - payload.epsilon_amount
+                target_after = target_before + payload.epsilon_amount
+
+                if source_after <= 0.0:
+                    raise TransferRejected(
+                        "source_cap_not_positive",
+                        f"source dataset {source['dataset_id']!r} cap would drop "
+                        f"to {source_after:.6g}; it must remain positive",
+                    )
+                if source_committed > source_after + settings.epsilon_tolerance:
+                    raise TransferRejected(
+                        "source_budget_overdrawn",
+                        f"source dataset {source['dataset_id']!r} cap after "
+                        f"transfer ({source_after:.6g}) would not cover its "
+                        f"committed epsilon {source_committed:.6g}",
+                    )
+                if target_after > MAX_EPSILON_CAP + settings.epsilon_tolerance:
+                    raise TransferRejected(
+                        "target_cap_exceeded",
+                        f"target dataset {target['dataset_id']!r} cap would rise "
+                        f"to {target_after:.6g}, above the registration limit "
+                        f"{MAX_EPSILON_CAP:.6g}",
+                    )
+
+                await db.update_dataset_epsilon_cap(
+                    conn, source["dataset_id"], source_after
+                )
+                await db.update_dataset_epsilon_cap(
+                    conn, target["dataset_id"], target_after
+                )
+                await db.insert_transfer(
+                    conn,
+                    transfer_id=payload.transfer_id,
+                    source_dataset_id=source["dataset_id"],
+                    target_dataset_id=target["dataset_id"],
+                    epsilon_amount=payload.epsilon_amount,
+                    source_cap_before=source_before,
+                    source_cap_after=source_after,
+                    target_cap_before=target_before,
+                    target_cap_after=target_after,
+                    source_committed=source_committed,
+                    target_committed=target_committed,
+                    created_at=now_iso,
+                )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+
+            row = await db.get_transfer(conn, payload.transfer_id)
+            return _transfer_view(row, replay=False), 201

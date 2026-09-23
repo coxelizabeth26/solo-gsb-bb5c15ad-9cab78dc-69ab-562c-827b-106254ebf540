@@ -18,6 +18,15 @@ Rényi DP（RDP）orders 上累加各次申请的组合消耗，在并发申请�
 给定一个未来 UTC 截止时间，按 `expires_at` 分组模拟预留到期并逐刻重算
 剩余 epsilon 与活动预留数，全程不改写任何预留状态或数据库。
 
+此外支持跨数据集的**预算转拨（budget transfer）**：客户端以
+`transfer_id`、来源数据集、目标数据集和正数 `epsilon_amount`，把一部分
+`epsilon_cap` 从来源转给目标（`delta_cap` 与已入账申请不变）。转拨前按同一
+套 RDP 规则分别计算两端「已授权申请 + 未过期预留」的占用：来源转出后的
+上限必须为正且足以覆盖其现有占用，目标转入后的上限不得超过登记上限
+1000，否则整笔拒绝、两个上限均不变。校验、更新与转拨记录在同一个
+SQLite 写事务内完成；相同 `transfer_id` + 相同负载重试返回原记录且不再次
+转拨，负载不同返回 `409`。
+
 ---
 
 ## 1. 快速启动（Docker Compose）
@@ -104,6 +113,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/datasets/{dataset_id}/reservations/{reservation_id}/confirm` | 确认预留 → 分析申请（幂等） |
 | `POST` | `/datasets/{dataset_id}/reservations/{reservation_id}/release` | 释放预留（幂等） |
 | `GET` | `/datasets/{dataset_id}/budget/release-forecast?deadline=...` | **只读**模拟截止时间前的预留到期释放 |
+| `POST` | `/budget-transfers` | 跨数据集转拨 epsilon 上限（原子、幂等） |
 | `GET` | `/health` | 健康检查 |
 
 `dataset_id` / `reservation_id` 允许字母、数字、`.`、`_`、`-`，长度 ≤ 200。
@@ -423,6 +433,74 @@ curl -G http://localhost:8000/datasets/sales-2026/budget/release-forecast \
 * 无时区信息的裸时间 → `422 invalid_forecast_deadline`；
 * `deadline` 不晚于当前时间 → `422 invalid_forecast_deadline`。
 
+### 4.12 跨数据集预算转拨
+
+把一部分 `epsilon_cap` 从来源数据集转给目标数据集（只动 epsilon 上限，
+`delta_cap` 与已入账的申请/预留记录均不变）：
+
+```bash
+curl -X POST http://localhost:8000/budget-transfers \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "transfer_id": "xfer-20260923-0001",
+    "source_dataset_id": "sales-2026",
+    "target_dataset_id": "sales-2027",
+    "epsilon_amount": 0.25
+  }'
+```
+
+请求体：
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `transfer_id` | string | 必填，客户端生成的幂等键，**全局唯一** |
+| `source_dataset_id` | string | 必填，来源数据集（上限被扣减），命名规则同 `dataset_id` |
+| `target_dataset_id` | string | 必填，目标数据集（上限被增加），须与来源不同 |
+| `epsilon_amount` | float | `> 0`，转拨的 epsilon 上限额度 |
+
+成功返回 `201` 与转拨记录：
+
+```json
+{
+  "transfer_id": "xfer-20260923-0001",
+  "source_dataset_id": "sales-2026",
+  "target_dataset_id": "sales-2027",
+  "epsilon_amount": 0.25,
+  "source_epsilon_cap_before": 1.0,
+  "source_epsilon_cap_after": 0.75,
+  "target_epsilon_cap_before": 0.5,
+  "target_epsilon_cap_after": 0.75,
+  "source_committed": 0.203936,
+  "target_committed": 0.0,
+  "idempotent_replay": false,
+  "created_at": "2026-09-23T01:10:16.563790+00:00"
+}
+```
+
+其中 `source_committed` / `target_committed` 是校验时刻两端按现有 RDP 规则
+算出的占用（已授权申请与未过期预留一起组合后的投影 epsilon），与转拨前后
+的两个上限一起构成完整审计记录。
+
+**校验规则**（任一不满足即整笔拒绝，两个上限均不变，返回 `409`）：
+
+* 来源转出后的上限必须**为正**（`source_cap - amount > 0`），否则
+  `source_cap_not_positive`；
+* 来源转出后的上限必须**足以覆盖其现有占用**（已授权申请 + 未过期预留的
+  RDP 组合消耗），否则 `source_budget_overdrawn`；
+* 目标转入后的上限不得超过登记上限 **1000**，否则 `target_cap_exceeded`。
+
+其他行为：
+
+* **原子性**：校验、两个上限的更新与转拨记录在同一个 `BEGIN IMMEDIATE`
+  写事务内提交；与申请/预留共用同一把写锁，因此并发转拨与普通申请怎样
+  交错都不会使任何数据集预算透支；
+* **幂等**：相同 `transfer_id` + 相同负载重试返回 `200` 与原记录
+  （`idempotent_replay=true`），预算只转一次；相同 `transfer_id` 但来源/
+  目标/金额任一不同 → `409 transfer_id_conflict`；
+* 被拒绝的转拨**不落记录**：状态变化后可用同一 `transfer_id` 重试；
+* 来源或目标数据集不存在 → `404 dataset_not_found`；
+  `epsilon_amount <= 0`、来源与目标相同、缺字段等 → `422`。
+
 ---
 
 ## 5. RDP 组合会计（核算口径）
@@ -469,17 +547,20 @@ curl -G http://localhost:8000/datasets/sales-2026/budget/release-forecast \
 
 ## 6. 并发与原子性
 
-* 每个写操作（登记、提交申请、创建/确认/释放预留）在进程内
+* 每个写操作（登记、提交申请、创建/确认/释放预留、预算转拨）在进程内
   `asyncio.Lock` 保护下打开一个 SQLite **`BEGIN IMMEDIATE`** 事务：
   「惰性过期清理 → 查重/查状态 → 重算（已授权申请 + 有效预留）组合消耗 →
   判定 → 插入/更新记录」在同一个事务临界区内完成，并发操作被串行化，
   **申请与预留无论怎样并发交错，已授权 + 有效预留的组合消耗都不会超过
   cap**；
+* 预算转拨同样在该临界区内完成「两端占用核算 → 校验 → 同时更新两个
+  `epsilon_cap` → 写入转拨记录」，因此并发转拨与普通申请/预留不会使任何
+  数据集透支，拒绝的转拨整体回滚、两个上限都保持不变；
 * 预留的确认同样在该临界区内完成「插入 granted 申请 + 预留置
   confirmed」，两步原子，预算不可能被扣两次；
 * SQLite 启用 **WAL** 与 `busy_timeout`：读不阻塞写，写冲突排队等待
-  而非立即报错；`(dataset_id, request_id)` 与 `(dataset_id,
-  reservation_id)` 上各有 `UNIQUE` 约束作为最终防线；
+  而非立即报错；`(dataset_id, request_id)`、`(dataset_id,
+  reservation_id)` 与全局 `transfer_id` 上各有 `UNIQUE` 约束作为最终防线；
 * 拒绝不写入任何消耗，只留一条 `rejected` 记录，因此并发请求/预留中
   “先到先得、额满即拒”；
 * TTL 过期为**惰性**处理：任何读写路径进入临界区时先把到期预留标记为
@@ -496,9 +577,10 @@ Schema 由 SQLite 的 `PRAGMA user_version` 管理，服务启动时自动顺序
 | --- | --- |
 | 1 | `datasets`、`requests` 表（原始版本） |
 | 2 | 新增 `reservations` 表（含状态、TTL、`expires_at` / `expired_at` / `confirmed_at` / `released_at` 等时间列与部分索引） |
+| 3 | 新增 `budget_transfers` 表（全局唯一 `transfer_id`、来源/目标数据集、金额、两端转拨前后上限与占用快照） |
 
-旧版本数据库（无 `user_version`，即 v0）启动时会先确保 v1 表存在再升级
-到 v2，已有数据集与申请记录原样保留。
+旧版本数据库（无 `user_version`，即 v0）启动时会先确保 v1 表存在再逐级升级
+到最新版本，已有数据集、申请与预留记录原样保留。
 
 ---
 
@@ -525,6 +607,13 @@ RDP 数学性质、幂等回放（含拒绝回放）、`request_id` 冲突 409�
 截止时仍有效预留继续计入、拒绝/已释放预留被忽略、非 UTC 带偏移时间归一
 化、裸时间/过去时间/缺参数/坏格式返回 422、缺失数据集 404，以及预测
 接口不改写预留状态（不触发惰性过期、重复调用结果一致）。
+
+预算转拨测试覆盖：成功转拨后两端上限与 `delta_cap`/申请记录不变、转拨
+额度在目标立即可用、来源上限为正的边界与覆盖已授权申请/未过期预留的
+占用校验、目标上限 1000 边界、整笔拒绝两端不变、缺失数据集 404、非法
+负载 422、同 `transfer_id` 同负载幂等回放（预算只转一次）与异负载 409、
+拒绝后同键可重试、20 路相同转拨并发仅生效一次、40 路申请与 15 路转拨
+混合并发下来源数据集始终不透支，以及从 v2 schema 启动时的自动迁移。
 
 ---
 
