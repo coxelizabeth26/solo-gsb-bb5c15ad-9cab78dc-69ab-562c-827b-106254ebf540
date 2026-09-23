@@ -11,7 +11,9 @@ from . import db, rdp
 from .config import settings
 from .schemas import (
     AnalysisRequest,
+    BudgetTransferRequest,
     DatasetRegister,
+    MAX_EPSILON_CAP,
     ReservationConfirm,
     ReservationCreate,
     utcnow,
@@ -715,3 +717,173 @@ async def release_forecast(
         "events": events,
         "at_deadline": _forecast_snapshot_view(at_deadline),
     }
+
+
+# ------------------------------------------------------------- transfers ---
+
+
+def _transfer_side_view(
+    dataset_id: str, cap_after: float, committed: float
+) -> dict[str, Any]:
+    return {
+        "dataset_id": dataset_id,
+        "epsilon_cap": cap_after,
+        "epsilon_committed": max(0.0, committed),
+        "epsilon_remaining": max(0.0, cap_after - committed),
+    }
+
+
+def _transfer_view_from_row(
+    row: aiosqlite.Row, *, replay: bool
+) -> dict[str, Any]:
+    """Reconstruct the API verdict from a stored transfer record."""
+    allowed = row["status"] == "transferred"
+    return {
+        "transfer_id": row["transfer_id"],
+        "source_dataset_id": row["source_dataset_id"],
+        "target_dataset_id": row["target_dataset_id"],
+        "epsilon_amount": row["epsilon_amount"],
+        "allowed": allowed,
+        "status": row["status"],
+        "reason": row["reason"],
+        "source": _transfer_side_view(
+            row["source_dataset_id"],
+            row["source_epsilon_cap_after"],
+            row["source_epsilon_committed"],
+        ),
+        "target": _transfer_side_view(
+            row["target_dataset_id"],
+            row["target_epsilon_cap_after"],
+            row["target_epsilon_committed"],
+        ),
+        "idempotent_replay": replay,
+        "created_at": row["created_at"],
+    }
+
+
+async def transfer_budget(
+    payload: BudgetTransferRequest,
+) -> tuple[dict[str, Any], int]:
+    """Atomically move epsilon cap from one dataset to another.
+
+    Admission (all inside one ``BEGIN IMMEDIATE`` transaction):
+
+    * source after the debit must stay strictly positive and must still cover
+      its granted requests + non-expired reservations under RDP;
+    * target after the credit must not exceed the registered ceiling
+      :data:`MAX_EPSILON_CAP`;
+    * otherwise the whole transfer is rejected and **both caps stay unchanged**
+      (the rejected attempt is still recorded for auditing).
+
+    ``delta_cap`` and every already-recorded request/reservation are left
+    untouched on both sides.
+    """
+    now_iso = utcnow().isoformat()
+
+    async with _write_lock():
+        async with db.connect() as conn:
+            await db.begin_immediate(conn)
+            try:
+                existing = await db.get_budget_transfer(conn, payload.transfer_id)
+                if existing is not None:
+                    same = (
+                        existing["source_dataset_id"] == payload.source_dataset_id
+                        and existing["target_dataset_id"] == payload.target_dataset_id
+                        and existing["epsilon_amount"] == payload.epsilon_amount
+                    )
+                    if not same:
+                        raise db.TransferConflict(payload.transfer_id)
+                    view = _transfer_view_from_row(existing, replay=True)
+                    await conn.commit()
+                    return view, 200
+
+                source = await db.require_dataset(conn, payload.source_dataset_id)
+                target = await db.require_dataset(conn, payload.target_dataset_id)
+
+                # Occupancy is evaluated with the exact same RDP admission path
+                # as ordinary requests/reservations (the lazy reservation sweep
+                # runs inside this transaction too).
+                source_entries = await _committed_entries(
+                    conn, payload.source_dataset_id, now_iso
+                )
+                _, source_committed, _ = rdp.evaluate_entries(
+                    source_entries, source["delta_cap"]
+                )
+                target_entries = await _committed_entries(
+                    conn, payload.target_dataset_id, now_iso
+                )
+                _, target_committed, _ = rdp.evaluate_entries(
+                    target_entries, target["delta_cap"]
+                )
+                source_committed = max(0.0, source_committed)
+                target_committed = max(0.0, target_committed)
+
+                amount = payload.epsilon_amount
+                source_cap_before = source["epsilon_cap"]
+                target_cap_before = target["epsilon_cap"]
+                source_cap_after = source_cap_before - amount
+                target_cap_after = target_cap_before + amount
+
+                reasons: list[str] = []
+                if source_cap_after <= 0.0:
+                    reasons.append(
+                        f"source cap must stay positive: {source_cap_before:g} "
+                        f"- {amount:g} = {source_cap_after:g}"
+                    )
+                if source_cap_after < source_committed - settings.epsilon_tolerance:
+                    reasons.append(
+                        f"source cap {source_cap_after:g} after the debit would "
+                        f"not cover its committed epsilon "
+                        f"{source_committed:.6g}"
+                    )
+                if target_cap_after > MAX_EPSILON_CAP + settings.epsilon_tolerance:
+                    reasons.append(
+                        f"target cap {target_cap_after:g} after the credit would "
+                        f"exceed the registered ceiling {MAX_EPSILON_CAP:g}"
+                    )
+
+                if not reasons:
+                    status = "transferred"
+                    reason: Optional[str] = None
+                    final_source_cap = source_cap_after
+                    final_target_cap = target_cap_after
+                    await db.update_dataset_epsilon_cap(
+                        conn,
+                        dataset_id=payload.source_dataset_id,
+                        epsilon_cap=source_cap_after,
+                    )
+                    await db.update_dataset_epsilon_cap(
+                        conn,
+                        dataset_id=payload.target_dataset_id,
+                        epsilon_cap=target_cap_after,
+                    )
+                else:
+                    status = "rejected"
+                    reason = "; ".join(reasons)
+                    # Rejected transfer: caps unchanged on both sides.
+                    final_source_cap = source_cap_before
+                    final_target_cap = target_cap_before
+
+                await db.insert_budget_transfer(
+                    conn,
+                    transfer_id=payload.transfer_id,
+                    source_dataset_id=payload.source_dataset_id,
+                    target_dataset_id=payload.target_dataset_id,
+                    epsilon_amount=amount,
+                    status=status,
+                    reason=reason,
+                    source_epsilon_cap_before=source_cap_before,
+                    source_epsilon_cap_after=final_source_cap,
+                    source_epsilon_committed=source_committed,
+                    target_epsilon_cap_before=target_cap_before,
+                    target_epsilon_cap_after=final_target_cap,
+                    target_epsilon_committed=target_committed,
+                    created_at=now_iso,
+                )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+
+            row = await db.get_budget_transfer(conn, payload.transfer_id)
+            return _transfer_view_from_row(row, replay=False), 201

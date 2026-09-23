@@ -96,9 +96,37 @@ CREATE INDEX IF NOT EXISTS idx_reservations_active
     WHERE status = 'granted';
 """
 
+# Version 3: epsilon-cap transfers between datasets.  A row is the immutable
+# audit record of one POST /budget-transfers call (idempotency key
+# ``transfer_id`` is globally unique): rejected attempts are stored too, with
+# both *_cap_before == *_cap_after so a replay returns the original verdict and
+# caps are demonstrably untouched.  Only epsilon_cap moves; delta_cap and all
+# granted requests / reservations of both datasets are left unchanged.
+SCHEMA_V3 = """
+CREATE TABLE IF NOT EXISTS budget_transfers (
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    transfer_id               TEXT NOT NULL UNIQUE,
+    source_dataset_id         TEXT NOT NULL REFERENCES datasets(dataset_id),
+    target_dataset_id         TEXT NOT NULL REFERENCES datasets(dataset_id),
+    epsilon_amount            REAL NOT NULL,
+    status                    TEXT NOT NULL CHECK (status IN (
+                                  'transferred', 'rejected'
+                              )),
+    reason                    TEXT,
+    source_epsilon_cap_before REAL NOT NULL,
+    source_epsilon_cap_after  REAL NOT NULL,
+    source_epsilon_committed  REAL NOT NULL,
+    target_epsilon_cap_before REAL NOT NULL,
+    target_epsilon_cap_after  REAL NOT NULL,
+    target_epsilon_committed  REAL NOT NULL,
+    created_at                TEXT NOT NULL
+);
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: SCHEMA_V1,
     2: SCHEMA_V2,
+    3: SCHEMA_V3,
 }
 LATEST_VERSION = max(MIGRATIONS)
 
@@ -131,6 +159,10 @@ class ReservationStateConflict(Exception):
 
     ``args[0]`` carries an API error code, ``args[1]`` the human detail.
     """
+
+
+class TransferConflict(Exception):
+    """Same transfer_id reused with a different payload (HTTP 409)."""
 
 
 # -------------------------------------------------------------- connection --
@@ -472,3 +504,68 @@ async def backdate_reservation_expiry(
         "WHERE dataset_id = ? AND reservation_id = ?",
         (expires_at, dataset_id, reservation_id),
     )
+
+
+# ------------------------------------------------------------ cap transfers --
+
+
+async def update_dataset_epsilon_cap(
+    db: aiosqlite.Connection,
+    *,
+    dataset_id: str,
+    epsilon_cap: float,
+) -> None:
+    """Set a dataset's epsilon cap inside the caller's transaction."""
+    await db.execute(
+        "UPDATE datasets SET epsilon_cap = ? WHERE dataset_id = ?",
+        (epsilon_cap, dataset_id),
+    )
+
+
+async def insert_budget_transfer(
+    db: aiosqlite.Connection,
+    *,
+    transfer_id: str,
+    source_dataset_id: str,
+    target_dataset_id: str,
+    epsilon_amount: float,
+    status: str,
+    reason: Optional[str],
+    source_epsilon_cap_before: float,
+    source_epsilon_cap_after: float,
+    source_epsilon_committed: float,
+    target_epsilon_cap_before: float,
+    target_epsilon_cap_after: float,
+    target_epsilon_committed: float,
+    created_at: str,
+) -> None:
+    await db.execute(
+        "INSERT INTO budget_transfers "
+        "(transfer_id, source_dataset_id, target_dataset_id, epsilon_amount, "
+        "status, reason, source_epsilon_cap_before, source_epsilon_cap_after, "
+        "source_epsilon_committed, target_epsilon_cap_before, "
+        "target_epsilon_cap_after, target_epsilon_committed, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            transfer_id, source_dataset_id, target_dataset_id, epsilon_amount,
+            status, reason, source_epsilon_cap_before, source_epsilon_cap_after,
+            source_epsilon_committed, target_epsilon_cap_before,
+            target_epsilon_cap_after, target_epsilon_committed, created_at,
+        ),
+    )
+
+
+_TRANSFER_SELECT = (
+    "SELECT transfer_id, source_dataset_id, target_dataset_id, epsilon_amount, "
+    "status, reason, source_epsilon_cap_before, source_epsilon_cap_after, "
+    "source_epsilon_committed, target_epsilon_cap_before, "
+    "target_epsilon_cap_after, target_epsilon_committed, created_at "
+    "FROM budget_transfers WHERE transfer_id = ?"
+)
+
+
+async def get_budget_transfer(
+    db: aiosqlite.Connection, transfer_id: str
+) -> Optional[aiosqlite.Row]:
+    async with db.execute(_TRANSFER_SELECT, (transfer_id,)) as cur:
+        return await cur.fetchone()

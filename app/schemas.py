@@ -2,10 +2,19 @@
 from __future__ import annotations
 
 import math
+import re
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+# Epsilon caps may never exceed this registered ceiling; it also bounds the
+# destination dataset's cap after an incoming budget transfer.
+MAX_EPSILON_CAP = 1_000.0
+
+# Mirrors the {dataset_id} path constraint in main.py.
+_DATASET_ID_PATTERN = re.compile(r"^[A-Za-z0-9._\-]+$")
 
 
 def _finite(name: str):
@@ -23,7 +32,7 @@ class DatasetRegister(BaseModel):
     epsilon_cap: float = Field(
         ...,
         gt=0.0,
-        le=1_000.0,
+        le=MAX_EPSILON_CAP,
         examples=[1.0],
         description="Total epsilon budget allowed for this dataset.",
     )
@@ -273,6 +282,98 @@ class ReleaseForecast(BaseModel):
     # State with every expires_at <= deadline removed; reservations expiring
     # strictly after the deadline (or never) keep counting.
     at_deadline: ForecastSnapshot
+
+
+# ------------------------------------------------------------- transfers ---
+
+
+class BudgetTransferRequest(BaseModel):
+    """Move epsilon cap between two datasets.
+
+    Only ``epsilon_cap`` is moved; delta caps and all already-recorded
+    analysis requests / reservations are left untouched.
+    """
+
+    transfer_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        examples=["xfer-20260923-0001"],
+        description="Client-generated idempotency key; globally unique.",
+    )
+    source_dataset_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        examples=["sales-2025"],
+        description="Dataset whose epsilon cap is debited.",
+    )
+    target_dataset_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        examples=["sales-2026"],
+        description="Dataset whose epsilon cap is credited.",
+    )
+    epsilon_amount: float = Field(
+        ...,
+        gt=0.0,
+        le=MAX_EPSILON_CAP,
+        examples=[0.25],
+        description="Positive epsilon cap amount transferred source -> target.",
+    )
+
+    _eps_finite = _finite("epsilon_amount")
+
+    @field_validator("transfer_id", "source_dataset_id", "target_dataset_id")
+    @classmethod
+    def _valid_id(cls, v: str) -> str:
+        if not _DATASET_ID_PATTERN.fullmatch(v):
+            raise ValueError(
+                "may contain only letters, digits, '.', '_' and '-'"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _distinct_endpoints(self) -> "BudgetTransferRequest":
+        if self.source_dataset_id == self.target_dataset_id:
+            raise ValueError(
+                "source_dataset_id and target_dataset_id must differ"
+            )
+        return self
+
+
+class BudgetTransferSide(BaseModel):
+    """One endpoint's cap/occupancy around a transfer."""
+
+    dataset_id: str
+    epsilon_cap: float
+    # Composed epsilon occupied by granted requests + non-expired
+    # reservations, evaluated under the existing RDP rules.
+    epsilon_committed: float
+    epsilon_remaining: float
+
+
+class BudgetTransferView(BaseModel):
+    """Result of a budget-transfer attempt.
+
+    A refused transfer is returned with HTTP 201 and ``allowed = false``:
+    the attempt was processed atomically and recorded, but neither cap
+    changed.  Replaying the same ``transfer_id`` returns the stored record
+    (``idempotent_replay = true``) without transferring again.
+    """
+
+    transfer_id: str
+    source_dataset_id: str
+    target_dataset_id: str
+    epsilon_amount: float
+    allowed: bool
+    status: Literal["transferred", "rejected"]
+    reason: Optional[str] = None
+    source: BudgetTransferSide
+    target: BudgetTransferSide
+    idempotent_replay: bool = False
+    created_at: datetime
 
 
 def utcnow() -> datetime:
